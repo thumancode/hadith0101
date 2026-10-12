@@ -1,0 +1,126 @@
+name: Extract ZIP into Main Repository
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '*.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extract-zip-main-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  extract-zip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Find and safely extract ZIP into repository root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t ZIP_FILES < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
+
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "No ZIP file found in the repository root."
+            exit 1
+          fi
+
+          if [ "${#ZIP_FILES[@]}" -gt 1 ]; then
+            echo "More than one ZIP file found in the repository root:"
+            printf ' - %s\n' "${ZIP_FILES[@]}"
+            echo "Keep only the ZIP you want to extract, then rerun the workflow."
+            exit 1
+          fi
+
+          ZIP_NAME="${ZIP_FILES[0]}"
+          echo "Extracting: $ZIP_NAME"
+
+          mkdir -p "$RUNNER_TEMP/zip-unpack"
+          export ZIP_PATH="$GITHUB_WORKSPACE/$ZIP_NAME"
+          export EXTRACT_PATH="$RUNNER_TEMP/zip-unpack"
+
+          python3 <<'PY'
+          import os, zipfile
+          from pathlib import Path, PurePosixPath
+
+          zip_path = Path(os.environ["ZIP_PATH"])
+          extract_root = Path(os.environ["EXTRACT_PATH"]).resolve()
+
+          with zipfile.ZipFile(zip_path) as zf:
+              members = []
+              for info in zf.infolist():
+                  name = info.filename.replace("\\", "/")
+                  rel = PurePosixPath(name)
+                  if rel.is_absolute() or any(part in ("..", "") for part in rel.parts):
+                      raise SystemExit(f"Unsafe ZIP path rejected: {name}")
+                  target = (extract_root / Path(*rel.parts)).resolve()
+                  if target != extract_root and extract_root not in target.parents:
+                      raise SystemExit(f"ZIP path escapes extraction directory: {name}")
+                  members.append((info, rel))
+
+              # If the ZIP contains exactly one top-level directory and no
+              # top-level files, extract that directory's CONTENTS into the repo root.
+              top_parts = {rel.parts[0] for _, rel in members if rel.parts}
+              top_files = [
+                  rel for info, rel in members
+                  if rel.parts and len(rel.parts) == 1 and not info.is_dir()
+              ]
+              strip_wrapper = (
+                  len(top_parts) == 1
+                  and not top_files
+                  and any(len(rel.parts) > 1 for _, rel in members)
+              )
+              wrapper = next(iter(top_parts)) if strip_wrapper else None
+
+              for info, rel in members:
+                  if info.is_dir():
+                      continue
+                  parts = rel.parts[1:] if wrapper else rel.parts
+                  if not parts:
+                      continue
+                  target = extract_root.joinpath(*parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info) as src, target.open("wb") as dst:
+                      dst.write(src.read())
+                  # Preserve executable bits where the ZIP records them.
+                  mode = (info.external_attr >> 16) & 0o777
+                  if mode:
+                      target.chmod(mode)
+
+          print(f"Safely extracted ZIP contents to {extract_root}")
+          PY
+
+          # Copy all files, including dotfiles and nested folders, into repo root.
+          # Existing files with matching paths are overwritten; unrelated files remain.
+          rsync -a --exclude='.git/' "$RUNNER_TEMP/zip-unpack/" "$GITHUB_WORKSPACE/"
+
+          # Remove the uploaded archive so this workflow does not retrigger on its own commit.
+          rm -f -- "$GITHUB_WORKSPACE/$ZIP_NAME"
+
+      - name: Commit extracted files to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Extract uploaded ZIP into repository root [skip ci]"
+          git push origin HEAD:main
