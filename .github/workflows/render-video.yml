@@ -1,0 +1,55 @@
+name: Render Islamic Hadith Video
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'index.html'
+      - 'render.js'
+      - 'timestamps.txt'
+      - 'audio.mp3'
+      - 'logo.png'
+      - 'google-play-badge.png'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/render-video.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
+
+      - name: Install Node dependencies
+        run: npm install
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+
+      - name: Render MP4 video
+        run: npm run render
+
+      - name: Upload rendered video
+        uses: actions/upload-artifact@v4
+        with:
+          name: islamic-hadith-video
+          path: output/islamic-hadith-video.mp4
+          if-no-files-found: error
+          retention-days: 14
